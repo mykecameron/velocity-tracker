@@ -1,0 +1,14 @@
+#!/usr/bin/env ruby
+
+require 'bundler/inline'
+
+gemfile do
+  source 'https://rubygems.org'
+  gem 'ruby-trello'
+  gem 'dotenv'
+end
+
+require 'dotenv/load'
+
+puts "Secret: #{ENV['SECRET'].inspect}"
+
