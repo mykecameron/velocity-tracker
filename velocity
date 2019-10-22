@@ -5,10 +5,30 @@ require 'bundler/inline'
 gemfile do
   source 'https://rubygems.org'
   gem 'ruby-trello'
+  gem 'launchy'
   gem 'dotenv'
 end
 
 require 'dotenv/load'
+require 'trello'
 
-puts "Secret: #{ENV['SECRET'].inspect}"
+def authenticate
+  puts "Press enter to open the Trello authorization page. Be sure to copy the token!"
+
+  Trello.open_authorization_url(
+    key: ENV['TRELLO_API_KEY'],
+    name: 'Velocity Tracker',
+    scope: 'read',
+  )
+
+  print "Enter Trello token: "
+  member_token = gets.strip
+
+  Trello.configure do |config|
+    config.developer_public_key = ENV['TRELLO_API_KEY']
+    config.member_token = member_token
+  end
+end
+
+authenticate
 
