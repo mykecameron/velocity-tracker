@@ -1,0 +1,235 @@
+#!/usr/bin/env ruby
+
+require 'bundler/inline'
+
+gemfile do
+  source 'https://rubygems.org'
+  gem 'ruby-trello'
+  gem 'dotenv'
+  gem 'google-api-client'
+  gem 'googleauth'
+  gem 'launchy'
+end
+
+require 'dotenv/load'
+require 'trello'
+require 'googleauth'
+require 'googleauth/stores/file_token_store'
+require "google/apis/sheets_v4"
+
+module Velocity
+  class PointsCalculator
+    POINTS_REGEX = /\((?<points>\d+)\)/
+
+    LIST_NAMES = {
+      done: /^Done:/i,
+      todo: /^To\s*Do/i,
+      doing: /^Doing/i,
+      ready: /^Ready for Acceptance/i,
+      accepted: /^Accepted/i,
+    }
+
+    AUTHORIZATION_PARAMS = {
+      key: ENV['TRELLO_API_KEY'],
+      name: 'Velocity Tracker',
+      scope: 'read',
+    }
+
+    def initialize
+      authenticate
+    end
+
+    def points_done
+      points(:done)
+    end
+
+    def points_carryover
+      points(:todo) + points(:doing) + points(:ready) + points(:accepted)
+    end
+
+    private
+
+    def authenticate
+      unless saved_token
+        token = get_token
+        save_token(token)
+      end
+
+      Trello.configure do |config|
+        config.developer_public_key = ENV['TRELLO_API_KEY']
+        config.member_token = saved_token
+      end
+    end
+
+    def get_token
+      puts "Press enter to open the Trello authorization page."
+      gets
+
+      Trello.open_authorization_url(AUTHORIZATION_PARAMS)
+
+      print "Enter Trello token: "
+      gets.strip
+    end
+
+    def saved_token
+      @saved_token ||= begin
+        json = File.read(ENV['TRELLO_TOKEN_STORE_PATH'])
+        JSON.parse(json)['member_token']
+      rescue Errno::ENOENT
+        nil
+      rescue JSON::ParserError
+        puts "Deleting corrupt token file"
+        File.delete(ENV['TRELLO_TOKEN_STORE_PATH'])
+        nil
+      end
+    end
+
+    def clear_saved_token
+      @saved_token = nil
+      File.delete(ENV['TRELLO_TOKEN_STORE_PATH'])
+    end
+
+    def save_token(member_token)
+      @saved_token = nil
+      file = File.new(ENV['TRELLO_TOKEN_STORE_PATH'], 'w+')
+      file.write({member_token: member_token}.to_json)
+      file.close
+    end
+
+    def find_list(name)
+      lists.detect do |list|
+        list.name =~ LIST_NAMES[name]
+      end
+    end
+
+    def points(list_name)
+      with_authenticated_trello do
+        list = find_list(list_name)
+        list.cards.reduce(0) do |sum, card|
+          if matches = POINTS_REGEX.match(card.name)
+            sum + matches[:points].to_i
+          else
+            sum
+          end
+        end
+      end
+    end
+
+    def lists
+      @lists ||= with_authenticated_trello do
+        Trello::Board.find(ENV['TRELLO_BOARD_ID']).lists
+      end
+    end
+
+    def with_authenticated_trello
+      yield
+    rescue Trello::Error => error
+      if error.message == 'invalid token'
+        clear_saved_token
+        authenticate
+        yield
+      end
+    end
+  end
+
+  class Spreadsheet
+    OOB_URI = 'urn:ietf:wg:oauth:2.0:oob'
+    USER_ID = 'default'
+    SCOPE = Google::Apis::SheetsV4::AUTH_SPREADSHEETS
+    SPRINT_DATES_RANGE = "B2:B50"
+
+    def update
+      sheets_service.update_spreadsheet_value(
+        spreadsheet_id,
+        range_to_update,
+        values_range,
+        value_input_option: 'USER_ENTERED'
+      )
+    end
+
+    private
+
+    def authenticate_with_google
+      client_id = Google::Auth::ClientId.from_file(ENV['GOOGLE_CREDENTIALS_PATH'])
+      token_store = Google::Auth::Stores::FileTokenStore.new(
+        :file => ENV['GOOGLE_TOKEN_STORE_PATH'])
+      authorizer = Google::Auth::UserAuthorizer.new(client_id, SCOPE, token_store)
+
+      credentials = authorizer.get_credentials(USER_ID)
+      if credentials.nil?
+        url = authorizer.get_authorization_url(base_url: OOB_URI )
+        puts "Press enter to open the Google authorization page."
+        gets
+        Launchy.open(url.to_s)
+        print "Enter Google token: "
+        code = gets.strip
+        credentials = authorizer.get_and_store_credentials_from_code(
+          user_id: USER_ID, code: code, base_url: OOB_URI)
+      end
+
+      credentials
+    end
+
+    def sheets_service
+      @service ||= begin
+        service = Google::Apis::SheetsV4::SheetsService.new
+        service.client_options.application_name = "Velocity Tracker"
+        service.authorization = authenticate_with_google
+        service
+      end
+    end
+
+    def spreadsheet_id
+      @spreadsheet_id ||= ENV['GOOGLE_SPREADSHEET_ID']
+    end
+
+    def sprint_row_number
+      @sprint_row_number ||= begin
+        response = sheets_service.get_spreadsheet_values(
+          spreadsheet_id,
+          SPRINT_DATES_RANGE,
+        )
+        sprint_start_dates = response.values.flatten.map do |value|
+          Date.parse value
+        end
+        today = Date.today
+        current_sprint_start = sprint_start_dates.detect do |start_date|
+          sprint_range = start_date..start_date.next_day(13)
+          sprint_range.cover?(today)
+        end
+
+        # If today is the start of a print, we are probably trying to update the LAST sprint
+        if current_sprint_start == today
+          sprint_start_dates.index(current_sprint_start) + 1
+        else
+          sprint_start_dates.index(current_sprint_start) + 2
+        end
+      end
+    end
+
+    def range_to_update
+      @range_to_update ||= "H#{sprint_row_number}:I#{sprint_row_number}"
+    end
+
+    def values_range
+      @values_range ||= Google::Apis::SheetsV4::ValueRange.new(
+        values: [
+          [
+            points_calculator.points_done,
+            points_calculator.points_carryover
+          ]
+        ]
+      )
+    end
+
+    def points_calculator
+      @points_calculator ||= Velocity::PointsCalculator.new
+    end
+  end
+
+  def self.update_spreadsheet
+    Spreadsheet.new.update
+  end
+end
+
+Velocity.update_spreadsheet
